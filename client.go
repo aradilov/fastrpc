@@ -152,7 +152,7 @@ func (c *Client) SendNowait(req RequestWriter, releaseReq func(req RequestWriter
 	wi := acquireClientWorkItem()
 	wi.req = req
 	wi.releaseReq = releaseReq
-	wi.deadline = coarseTimeNow().Add(10 * time.Second)
+	wi.deadline = time.Now().Add(10 * time.Second)
 	if err := c.enqueueWorkItem(wi); err != nil {
 		releaseClientWorkItem(wi)
 		return false
@@ -416,7 +416,6 @@ func (c *Client) connWriter(bw *bufio.Writer, conn net.Conn, stopCh <-chan struc
 	}
 
 	writeTimeout := c.WriteTimeout
-	var lastWriteDeadline time.Time
 	var nextReqID uint32
 	for {
 		select {
@@ -436,7 +435,7 @@ func (c *Client) connWriter(bw *bufio.Writer, conn net.Conn, stopCh <-chan struc
 			}
 		}
 
-		t := coarseTimeNow()
+		t := time.Now()
 		if t.After(wi.deadline) {
 			c.doneError(wi, ErrTimeout)
 			continue
@@ -452,18 +451,12 @@ func (c *Client) connWriter(bw *bufio.Writer, conn net.Conn, stopCh <-chan struc
 		}
 
 		if writeTimeout > 0 {
-			// Optimization: update write deadline only if more than 25%
-			// of the last write deadline exceeded.
-			// See https://github.com/golang/go/issues/15133 for details.
-			if t.Sub(lastWriteDeadline) > (writeTimeout >> 2) {
-				if err := conn.SetWriteDeadline(t.Add(writeTimeout)); err != nil {
-					// do not panic here, since the error may
-					// indicate that the connection is already closed
-					err = fmt.Errorf("cannot update write deadline: %s", err)
-					c.doneError(wi, err)
-					return err
-				}
-				lastWriteDeadline = t
+			if err := conn.SetWriteDeadline(t.Add(writeTimeout)); err != nil {
+				// do not panic here, since the error may
+				// indicate that the connection is already closed
+				err = fmt.Errorf("cannot update write deadline: %s", err)
+				c.doneError(wi, err)
+				return err
 			}
 		}
 
@@ -516,21 +509,18 @@ func (c *Client) connReader(br *bufio.Reader, conn net.Conn) error {
 	zeroResp := c.NewResponse()
 
 	readTimeout := c.ReadTimeout
-	var lastReadDeadline time.Time
 	for {
 		if readTimeout > 0 {
 			// Optimization: update read deadline only if more than 25%
 			// of the last read deadline exceeded.
 			// See https://github.com/golang/go/issues/15133 for details.
-			t := coarseTimeNow()
-			if t.Sub(lastReadDeadline) > (readTimeout >> 2) {
-				if err := conn.SetReadDeadline(t.Add(readTimeout)); err != nil {
-					// do not panic here, since the error may
-					// indicate that the connection is already closed
-					return fmt.Errorf("cannot update read deadline: %s", err)
-				}
-				lastReadDeadline = t
+			t := time.Now()
+			if err := conn.SetReadDeadline(t.Add(readTimeout)); err != nil {
+				// do not panic here, since the error may
+				// indicate that the connection is already closed
+				return fmt.Errorf("cannot update read deadline: %s", err)
 			}
+
 		}
 
 		if _, err := io.ReadFull(br, buf[:]); err != nil {
