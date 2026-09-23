@@ -24,6 +24,12 @@ const (
 	// DefaultConcurrency is the default maximum number of concurrent
 	// Server.Handler goroutines the server may run.
 	DefaultConcurrency = 10000
+
+	// DefaultPendingResponsesPerConn is the default number of ready responses
+	// a single connection may hold between the handler and the writer.
+	//
+	// This parameter may be overridden by Server.PendingResponsesPerConn.
+	DefaultPendingResponsesPerConn = 1024
 )
 
 const (

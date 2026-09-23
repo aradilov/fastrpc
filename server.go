@@ -113,6 +113,38 @@ type Server struct {
 	// Standard logger from log package is used by default.
 	Logger fasthttp.Logger
 
+	// PendingResponsesPerConn is how many ready responses a single connection
+	// may hold between the handler and the writer.
+	//
+	// It used to be Concurrency, which made the buffer grow with the number of
+	// connections the server would accept: every connection allocated a channel
+	// of Concurrency pointers, so raising the connection limit cost memory
+	// quadratically. At the default 10000 that is 80KB per connection before a
+	// single request arrives.
+	//
+	// A full buffer only blocks the goroutine pushing into it, and the writer
+	// drains it independently, so a small value costs nothing but backpressure -
+	// which is the correct answer to a client outrunning its own writer.
+	//
+	// DefaultPendingResponsesPerConn is used by default.
+	PendingResponsesPerConn int
+
+	// ConnRejected is called when an accepted connection is refused because
+	// Concurrency is reached. The connection is closed by the server; the
+	// address is passed for logging and accounting, and must not be held.
+	//
+	// A refused connection is otherwise invisible: it is answered by nothing,
+	// so a client sees a socket that closes without a word, and the server sees
+	// only a log line. Anything that needs to know how much it is dropping -
+	// a counter, an alert, a capacity decision - hangs off this.
+	//
+	// Only called when PipelineRequests is set. Without it the limit applies to
+	// requests rather than connections, and HandlerCtx.ConcurrencyLimitError is
+	// what reports them.
+	//
+	// Must not block: it runs on the accept loop.
+	ConnRejected func(remoteAddr net.Addr, concurrency int)
+
 	// PipelineRequests enables requests' pipelining.
 	//
 	// Requests from a single client are processed serially
@@ -138,6 +170,25 @@ func (s *Server) concurrency() int {
 		concurrency = DefaultConcurrency
 	}
 	return concurrency
+}
+
+func (s *Server) pendingResponsesPerConn() int {
+	n := s.PendingResponsesPerConn
+	if n <= 0 {
+		n = DefaultPendingResponsesPerConn
+	}
+	return n
+}
+
+// ConcurrencyCount is what Concurrency is measured against right now: the
+// number of connections being served when PipelineRequests is set, and the
+// number of requests in flight when it is not.
+//
+// Exported so that a server can report how close it is to refusing work, which
+// is the number worth watching - by the time the refusals show up in the log,
+// the capacity decision is already late.
+func (s *Server) ConcurrencyCount() int {
+	return int(atomic.LoadUint32(&s.concurrencyCount))
 }
 
 // Serve serves rpc requests accepted from the given listener.
@@ -172,7 +223,21 @@ func (s *Server) Serve(ln net.Listener) error {
 			n := int(atomic.AddUint32(&s.concurrencyCount, 1))
 			if n > concurrency {
 				atomic.AddUint32(&s.concurrencyCount, ^uint32(0))
+
+				// Closed, which it was not before: the accepted connection was
+				// dropped on the floor still open, so every refusal leaked a
+				// file descriptor and left the client holding a socket nobody
+				// would ever read - waiting out its own timeout instead of
+				// failing at once.
+				raddr := conn.RemoteAddr()
+				conn.Close()
+
+				if s.ConnRejected != nil {
+					s.ConnRejected(raddr, concurrency)
+				}
+
 				s.logger().Printf("fastrpc.Server: concurrency limit exceeded: %d", concurrency)
+
 				continue
 			}
 		}
@@ -209,7 +274,7 @@ func (s *Server) serveConn(conn net.Conn) error {
 
 	stopCh := make(chan struct{})
 
-	pendingResponses := make(chan *serverWorkItem, s.concurrency())
+	pendingResponses := make(chan *serverWorkItem, s.pendingResponsesPerConn())
 	readerDone := make(chan error, 1)
 	go func() {
 		readerDone <- s.connReader(br, conn, pendingResponses, stopCh)
