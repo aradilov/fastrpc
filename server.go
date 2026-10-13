@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/tls"
 	"fmt"
+	"github.com/aradilov/workerpool"
 	"github.com/valyala/fasthttp"
 	"io"
 	"log"
@@ -156,12 +157,20 @@ type Server struct {
 	//   - if the Server.Handler doesn't block and maximum throughput
 	//     must be achieved for requests' processing.
 	//
-	// By default requests from a single client are processed concurrently.
+	// By default requests from a single client are processed concurrently,
+	// each by a worker of a pool shared by every connection (see workers).
 	PipelineRequests bool
 
 	workItemPool sync.Pool
 
 	concurrencyCount uint32
+
+	// workers runs the requests when PipelineRequests is not set. A worker
+	// outlives its request, so the stack a request grew is there for the next
+	// one: a goroutine per request starts from the smallest stack every time
+	// and pays for copying it as it grows, which on a deep handler is a few
+	// percent of the server's CPU.
+	workers *workerpool.WorkerPool
 }
 
 func (s *Server) concurrency() int {
@@ -198,6 +207,18 @@ func (s *Server) Serve(ln net.Listener) error {
 	}
 	concurrency := s.concurrency()
 	pipelineRequests := s.PipelineRequests
+
+	if !pipelineRequests && s.workers == nil {
+		s.workers = workerpool.New(workerPoolSize(concurrency))
+		// the worker errors are the handler's own; it has its logging
+		s.workers.LogAllErrors = false
+
+		// Requests still running on open connections finish on their
+		// workers, which then exit; a request arriving after this runs on
+		// a worker started for it alone.
+		defer s.workers.Stop()
+	}
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -342,12 +363,34 @@ func (s *Server) connReader(br *bufio.Reader, conn net.Conn, pendingResponses ch
 				}
 				continue
 			}
-			go func(wi *serverWorkItem) {
-				s.handleRequest(wi, pendingResponses, stopCh)
-				atomic.AddUint32(&s.concurrencyCount, ^uint32(0))
-			}(wi)
+			s.runRequest(wi, pendingResponses, stopCh)
 		}
 	}
+}
+
+// runRequest handles a request on a pooled worker, or on a goroutine of its own
+// when the pool has none free: the request is already admitted under
+// Concurrency, and the pool is sized to it, so that happens only for the
+// moment between a worker finishing one request and returning to the pool.
+func (s *Server) runRequest(wi *serverWorkItem, pendingResponses chan<- *serverWorkItem, stopCh <-chan struct{}) {
+	run := func() {
+		s.handleRequest(wi, pendingResponses, stopCh)
+		atomic.AddUint32(&s.concurrencyCount, ^uint32(0))
+	}
+
+	if s.workers == nil || !s.workers.Serve(run) {
+		go run()
+	}
+}
+
+// workerPoolSize is the pool size for concurrency: the next power of two, as
+// the pool requires.
+func workerPoolSize(concurrency int) int {
+	n := 1
+	for n < concurrency {
+		n <<= 1
+	}
+	return n
 }
 
 func (s *Server) handleRequest(wi *serverWorkItem, pendingResponses chan<- *serverWorkItem, stopCh <-chan struct{}) {

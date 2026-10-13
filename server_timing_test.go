@@ -3,7 +3,7 @@ package fastrpc
 import (
 	"bytes"
 	"crypto/tls"
-	"github.com/valyala/fastrpc/tlv"
+	"github.com/aradilov/fastrpc/tlv"
 	"runtime"
 	"sync/atomic"
 	"testing"
